@@ -39,6 +39,27 @@ CVE fix in dep X (e.g., helm v3.15 → v3.18)
 
 **Rule**: Upgrading across tiers introduces breaking changes. Within a tier, versions are compatible.
 
+### Vendor directory policy (hard rule)
+
+Before running any `go mod vendor`:
+
+```bash
+test -d vendor   # on the checkout of the *base* branch / start of the fix worktree
+# Or at a ref: git cat-file -e origin/<branch>:vendor
+```
+
+| Result | Action |
+|--------|--------|
+| `vendor/` **exists** | After `go get` / `go mod tidy`, run `go mod vendor` and include `vendor/` in the PR |
+| `vendor/` **missing** | **Do not** run `go mod vendor`. Commit **only** `go.mod` and `go.sum` |
+
+**Why:** Introducing a new `vendor/` tree into a non-vendored repo breaks hermetic
+Konflux builds. When `vendor/` is present, cachi2/Hermeto skips gomod prefetch
+(empty offline module cache). Dockerfiles that then run `rm -fr vendor && go
+mod vendor` fail offline (example: ACM-37377 / stolostron/cluster-permission#284).
+Mintmaker-style security bumps for non-vendored repos already use go.mod/go.sum
+only (e.g. cluster-permission#239).
+
 ### Golden Rule for Older Branches
 
 > **Never upgrade OCM dependencies (addon-framework, api, sdk-go) on older branches unless absolutely necessary.** These three libraries have breaking changes between tiers. Use `replace` directives to isolate the CVE fix from the broader dependency graph.
@@ -90,7 +111,8 @@ gh api repos/<org>/<repo>/tags --jq '.[].name' | grep '<minor>' | sort -V
 cd <repo-worktree>
 go get k8s.io/client-go@v0.30.14
 go mod tidy
-go mod vendor  # if using vendor mode
+# Only if vendor/ already existed on the base branch (see Vendor directory policy):
+# go mod vendor
 go build ./...
 ```
 
@@ -178,7 +200,8 @@ replace (
 
 ```bash
 go mod tidy
-go mod vendor  # if using vendor mode
+# Only if vendor/ already existed on the base branch (see Vendor directory policy):
+# go mod vendor
 go build ./...
 ```
 
@@ -195,8 +218,20 @@ If `go build` fails, it is usually because:
 ### Step 6C: Verify no source code changes
 
 ```bash
-# Should return empty — only go.mod, go.sum, and vendor/ should change
-git diff --name-only | grep -v '^vendor/' | grep -v '^go\.\(mod\|sum\)$'
+BASE=origin/<branch>   # e.g. origin/release-2.13 — the CVE fix target branch
+
+# Reject PRs that introduce vendor/ when the base branch had none
+base_has_vendor=false
+git cat-file -e "$BASE:vendor" 2>/dev/null && base_has_vendor=true
+pr_touches_vendor=false
+git diff --name-only "$BASE"...HEAD | grep -q '^vendor/' && pr_touches_vendor=true
+if [ "$pr_touches_vendor" = true ] && [ "$base_has_vendor" = false ]; then
+  echo "ERROR: PR introduces vendor/ but base branch has no vendor/" >&2
+  exit 1
+fi
+
+# Should return empty — only go.mod, go.sum, and vendor/ (if base was vendored) may change
+git diff --name-only "$BASE"...HEAD | grep -v '^vendor/' | grep -v '^go\.\(mod\|sum\)$'
 ```
 
 If any `.go` files outside `vendor/` are changed, something is wrong. The replace strategy should require **zero source code changes**.
@@ -297,11 +332,12 @@ go get helm.sh/helm/v3@v3.18.6
 # Step 3: Add replace block (pin k8s back to v0.30.14)
 # See template above
 
-# Step 4: Build
-go mod tidy && go mod vendor && go build ./...
+# Step 4: Build (go mod vendor only if vendor/ already existed — see policy)
+go mod tidy && go build ./...
+# If test -d vendor: also run go mod vendor before build
 ```
 
-**Result**: Build passes. Zero `.go` source changes. Only `go.mod`, `go.sum`, and `vendor/` modified.
+**Result**: Build passes. Zero `.go` source changes. Only `go.mod`, `go.sum`, and (if already vendored) `vendor/` modified.
 
 **Comparison with full upgrade approach**:
 
@@ -320,6 +356,7 @@ go mod tidy && go mod vendor && go build ./...
 Before submitting a CVE fix PR on an older branch:
 
 - [ ] Confirmed which strategy (A/C/D) is being used
+- [ ] Vendor policy: ran `go mod vendor` only if `vendor/` already existed on the base branch; did **not** introduce a new `vendor/` tree
 - [ ] If Strategy C: replace block pins ALL k8s.io and ecosystem packages (including cel-go, genproto)
 - [ ] `go build ./...` passes
 - [ ] `go test ./...` passes (or CI tests pass)
